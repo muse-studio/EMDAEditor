@@ -5,9 +5,6 @@ Created on Sun Nov  9 22:00:50 2025
 @author: wadaso
 """
 
-# -*- coding: utf-8 -*-
-
-
 import tkinter as tk
 from tkinter import filedialog
 from math import hypot
@@ -1127,3 +1124,4 @@ if __name__ == "__main__":
     root.geometry("1200x800")
     app = SnapHierarchyApp(root, num_lines=6)
     root.mainloop()
+
