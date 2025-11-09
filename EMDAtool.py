@@ -232,11 +232,6 @@ class SnapHierarchyApp:
         self.line_count_entry.bind("<Up>", lambda e: self._step_line_count(+1))
         self.line_count_entry.bind("<Down>", lambda e: self._step_line_count(-1))
 
-        # ステータス
-        self.status_var = tk.StringVar(value="")
-        status = tk.Label(self.master, textvariable=self.status_var, anchor="w")
-        status.pack(fill="x", padx=8)
-
         # キャンバス
         self.canvas = tk.Canvas(self.master, bg="white")
         self.canvas.pack(fill="both", expand=True)
@@ -258,13 +253,7 @@ class SnapHierarchyApp:
         self.update_line_count_from_entry()
 
     def _update_status(self):
-        vmin = int(round(self.view_min * 100))
-        vmax = int(round(self.view_max * 100))
-        span = int(round((self.view_max - self.view_min) * 100))
-        self.status_var.set(
-            f"表示範囲: {vmin}% 〜 {vmax}%（幅 {span}%）   操作: ホイール=ズーム / Shift+ホイール=パン / 中or右ドラッグ=パン / +,-,←,→,0"
-        )
-
+        pass
     # ---------- ビューポート操作 ----------
     def apply_view_range(self):
         try:
@@ -1101,4 +1090,5 @@ if __name__ == "__main__":
     root.geometry("1200x800")
     app = SnapHierarchyApp(root, num_lines=6)
     root.mainloop()
+
 
