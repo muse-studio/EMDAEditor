@@ -4,7 +4,6 @@ Created on Sun Nov  9 22:00:50 2025
 
 @author: wadaso
 """
-
 import tkinter as tk
 from tkinter import filedialog
 from math import hypot
@@ -113,6 +112,10 @@ class Line:
 
 class SnapHierarchyApp:
     def __init__(self, master, num_lines=6):
+        """
+        num_lines: 内部的な線の本数（右端の線も含む）
+        画面上に「見えている線の本数」は len(self.lines) - 1 になる。
+        """
         self.master = master
         self.master.title("EMDAtool")
         self.length = 150
@@ -136,16 +139,20 @@ class SnapHierarchyApp:
         self.lines = []
 
         # 上段テキスト
-        self.text_entries = []          # フレーム（従来）
-        self.top_entries = []           # ← エントリ本体の順序リスト（矢印移動用）
+        self.text_entries = []          # フレーム
+        self.top_entries = []           # エントリ本体の順序リスト（矢印移動用）
 
         # 下段（グループ行）
         self.group_row_frame = None
         self.group_canvas = None
         self.group_entries = []
         self.group_boundaries = []
-        self.group_text_cache = []
         self.group_separators = []
+        self.group_entry_spans = []
+
+        # テキスト内容のマップ
+        self._top_text_map = {}     # key: left_line_id -> text
+        self._group_text_map = {}   # key: left_line_id -> text（下段）
 
         self.top_entry_window_ids = []
         self.group_window_id = None
@@ -157,12 +164,18 @@ class SnapHierarchyApp:
         self.panning = False
         self.pan_last_x = None
 
-        self.setup_ui(num_lines)
-        self.bind_events()
-        self.add_menu_bar()
+        # ホバー中ハイライト管理（上段のみ）
+        self.highlighted_top_indices = []
 
         self.undo_stack = []
         self.redo_stack = []
+
+        # 復元中フラグ（ロード／Undo／Redo の間は True）
+        self.is_restoring = False
+
+        self.setup_ui(num_lines)
+        self.bind_events()
+        self.add_menu_bar()
 
     # ---------- UI ----------
     def setup_ui(self, num_lines):
@@ -209,15 +222,14 @@ class SnapHierarchyApp:
 
         # 数字バリデーション
         vcmd = (self.master.register(self._validate_int), "%P")
-        self.line_count_var = tk.StringVar(value=str(num_lines))
+        initial_visible = max(0, num_lines - 1)
+        self.line_count_var = tk.StringVar(value=str(initial_visible))
         self.line_count_entry = tk.Entry(entry_frame, textvariable=self.line_count_var, width=6,
                                          validate="key", validatecommand=vcmd, justify="right")
         self.line_count_entry.pack(side=tk.LEFT)
 
-        # 適用ボタン
         tk.Button(entry_frame, text="適用", command=self.apply_line_count, bg="#ffe").pack(side=tk.LEFT, padx=4)
 
-        # エントリの操作バインド
         self.line_count_entry.bind("<Return>", self.update_line_count_from_entry)
         self.line_count_entry.bind("<FocusOut>", self.update_line_count_from_entry)
         self.line_count_entry.bind("<Up>", lambda e: self._step_line_count(+1))
@@ -227,7 +239,9 @@ class SnapHierarchyApp:
         self.canvas = tk.Canvas(self.master, bg="white")
         self.canvas.pack(fill="both", expand=True)
 
+        # 内部的には num_lines 本作る（右端の隠し線も含む）
         self.create_lines(num_lines)
+        self.line_count_var.set(str(max(0, len(self.lines) - 1)))
         self._update_status()
 
     def _validate_int(self, P: str) -> bool:
@@ -311,6 +325,7 @@ class SnapHierarchyApp:
             self.delete_button.config(text="− 削除モード OFF", bg="SystemButtonFace", fg="black")
             self.show_insert_guides()
             self.clear_delete_guides()
+            self.clear_hover_highlight()
         else:
             self.add_button.config(text="＋ 追加モード OFF", bg="SystemButtonFace", fg="black")
             self.clear_insert_guides()
@@ -327,6 +342,7 @@ class SnapHierarchyApp:
         else:
             self.delete_button.config(text="− 削除モード OFF", bg="SystemButtonFace", fg="black")
             self.clear_delete_guides()
+            self.clear_hover_highlight()
         self.canvas.config(bg="#ddd" if self.delete_mode else ("#eef" if self.add_mode else "white"))
 
     def toggle_split_mode(self):
@@ -359,6 +375,10 @@ class SnapHierarchyApp:
         self.canvas.bind("<Button-5>", lambda e: self.on_wheel_linux(-1, e))
 
         self.canvas.bind("<Configure>", self.on_resize)
+
+        # 削除モード用：マウス移動でテキストボックスをハイライト
+        self.canvas.bind("<Motion>", self.on_motion)
+        self.canvas.bind("<Leave>", lambda e: self.clear_hover_highlight())
 
         # キー（グローバル）
         self.master.bind_all("<Control-z>", lambda event: self.undo())
@@ -428,38 +448,71 @@ class SnapHierarchyApp:
 
     # ---------- 線 本数変更など ----------
     def update_line_count_from_entry(self, event=None):
+        """
+        line_count_entry に入力される値は「見えている線の本数」と扱い、
+        内部的な本数は「見えている本数 + 1」とする。
+        一番右の線は内部に存在するが、描画・操作はしない。
+        """
         try:
             if not self.line_count_var.get():
                 return
-            new_count = int(self.line_count_var.get())
-            if new_count < 1:
-                return
-            current_count = len(self.lines)
-            if new_count == current_count:
+            new_visible = int(self.line_count_var.get())
+            if new_visible < 1:
                 return
 
-            self._snapshot_group_texts()
+            current_total = len(self.lines)
+            current_visible = max(0, current_total - 1)
+            if new_visible == current_visible:
+                return
 
-            if new_count > current_count:
-                for _ in range(new_count - current_count):
+            # 変更前のテキスト状態を保存（Undo 用）
+            self._snapshot_current_texts()
+            self.push_undo_state()
+
+            target_total = new_visible + 1  # 右端の隠し線を含む本数
+
+            # 本数を増やす場合
+            if target_total > current_total:
+                for _ in range(target_total - current_total):
                     new_id = max((line.line_id for line in self.lines), default=0) + 1
-                    self.lines.append(Line(self, self.canvas, 0.5, self.base_y_ratio, self.length, new_id))
-            else:
-                for _ in range(current_count - new_count):
-                    line = self.lines.pop()
+                    # 追加される線は「右端の隠し線の手前」に入れる
+                    insert_index = max(0, len(self.lines) - 1)
+
+                    # グループ境界を右側へシフト（挿入位置以降）
+                    self.group_boundaries = [
+                        b + 1 if b >= insert_index else b for b in self.group_boundaries
+                    ]
+
+                    self.lines.insert(
+                        insert_index,
+                        Line(self, self.canvas, 0.5, self.base_y_ratio, self.length, new_id)
+                    )
+
+            # 本数を減らす場合（見えている線だけ減らす）
+            elif target_total < current_total:
+                # 右端から見える線を削っていく
+                while len(self.lines) > target_total and len(self.lines) > 1:
+                    # 最後の見える線は index = -2
+                    line = self.lines[-2]
+
+                    # 下段テキストも対応位置を削除
+                    self._group_text_map.pop(line.line_id, None)
+
                     line.detach_from_parent()
                     for child in list(line.children):
                         child.detach_from_parent()
                     self.canvas.delete(line.id)
+                    self.lines.pop(-2)
 
-            # グループ境界を現在の本数に合わせてクランプ
-            self.group_boundaries = [b for b in self.group_boundaries if 1 <= b <= max(0, new_count - 2)]
+                # グループ境界を現在の内部本数に合わせてクランプ
+                max_idx = max(0, len(self.lines) - 2)
+                self.group_boundaries = [b for b in self.group_boundaries if 1 <= b <= max_idx]
 
             self.renormalize_ratios()
             self.redraw_all()
 
-            # UI と実際の本数の同期
-            self.line_count_var.set(str(len(self.lines)))
+            # UI と「見えている本数」を同期
+            self.line_count_var.set(str(max(0, len(self.lines) - 1)))
         except ValueError:
             pass
 
@@ -473,12 +526,30 @@ class SnapHierarchyApp:
     def redraw_all(self):
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
+
+        # まず全線の base 座標だけ更新（右端の隠し線も含む）
         for line in self.lines:
             line.update_base_position(width, height)
+
+        # 一番右の線（self.lines[-1]）は描画しない
+        visible_lines = self.lines[:-1] if len(self.lines) >= 1 else []
+
+        # 既存の線の描画を消しつつ、見える線のみ描画
+        for line in visible_lines:
             line.draw()
-        for line in self.lines:
-            if line.parent:
+
+        # 隠し線が以前描画されていた場合は消しておく
+        if self.lines:
+            hidden = self.lines[-1]
+            if hidden.id:
+                self.canvas.delete(hidden.id)
+                hidden.id = None
+
+        # 親子スナップの反映（見える線のみ）
+        for line in visible_lines:
+            if line.parent and (line.parent in visible_lines):
                 line.follow_parent()
+
         if self.add_mode:
             self.show_insert_guides()
         if self.delete_mode:
@@ -486,18 +557,34 @@ class SnapHierarchyApp:
         self.draw_text_rows_and_group_row()
 
     # ---------- 上段/下段 UI ----------
+    def _snapshot_group_texts(self):
+        """
+        下段テキストを『left_line_id → テキスト』で保存する。
+        ここでは self.lines のインデックスを使わず、
+        各 Entry に持たせた entry.left_line_id を使う。
+        """
+        self._group_text_map = {}
+        for entry in self.group_entries:
+            key = getattr(entry, "left_line_id", None)
+            if key is not None:
+                self._group_text_map[key] = entry.get()
+
     def _snapshot_current_texts(self):
+        """上段・下段のテキスト状態を line_id ベースでスナップショット"""
+        # 復元中は何もしない（ロードやUndo/Redo直後の top_texts を壊さない）
+        if getattr(self, "is_restoring", False):
+            return
+
+        # 上段
         self._top_text_map = {}
         for frame in self.text_entries:
             entry = frame.winfo_children()[0]
             key = getattr(frame, "left_line_id", None)
             if key is not None:
                 self._top_text_map[key] = entry.get()
-        self.group_text_cache = [e.get() for e in self.group_entries] if self.group_entries else list(self.group_text_cache)
 
-    def _snapshot_group_texts(self):
-        if self.group_entries:
-            self.group_text_cache = [e.get() for e in self.group_entries]
+        # 下段
+        self._snapshot_group_texts()
 
     # ==== ここから：矢印キー移動のユーティリティ ====
     def _focus_prev(self, widgets, current):
@@ -509,7 +596,8 @@ class SnapHierarchyApp:
             target = widgets[i - 1]
             target.focus_set()
             try:
-                target.select_range(0, "end"); target.icursor("end")
+                target.select_range(0, "end")
+                target.icursor("end")
             except Exception:
                 pass
         return "break"
@@ -523,15 +611,18 @@ class SnapHierarchyApp:
             target = widgets[i + 1]
             target.focus_set()
             try:
-                target.select_range(0, "end"); target.icursor("end")
+                target.select_range(0, "end")
+                target.icursor("end")
             except Exception:
                 pass
         return "break"
     # ==============================================
 
     def draw_text_rows_and_group_row(self):
+        # 現在のテキストを line_id ベースで保存
         self._snapshot_current_texts()
 
+        # 既存のウィンドウを削除
         for wid in getattr(self, "top_entry_window_ids", []):
             self.canvas.delete(wid)
         self.top_entry_window_ids.clear()
@@ -539,10 +630,11 @@ class SnapHierarchyApp:
             self.canvas.delete(self.group_window_id)
             self.group_window_id = None
 
+        # 既存のフレーム/エントリを破棄
         for frame in self.text_entries:
             frame.destroy()
         self.text_entries.clear()
-        self.top_entries.clear()  # ← 追加：上段エントリの順序リストをクリア
+        self.top_entries.clear()
 
         if self.group_row_frame is not None:
             for sep in self.group_separators:
@@ -552,6 +644,7 @@ class SnapHierarchyApp:
             self.group_row_frame = None
             self.group_canvas = None
             self.group_entries.clear()
+            self.group_entry_spans.clear()
 
         if len(self.lines) < 2:
             return
@@ -582,21 +675,21 @@ class SnapHierarchyApp:
                              justify="center", highlightthickness=0)
             entry.pack(fill="both", expand=True)
 
-            # 既存テキスト復元
-            if hasattr(self, "_top_text_map") and line1.line_id in self._top_text_map:
+            # 既存テキスト復元（line_id ベース）
+            if line1.line_id in self._top_text_map:
                 entry.insert(0, self._top_text_map[line1.line_id])
 
             # ←→ の移動バインド（上段）
-            entry.bind("<Left>",  lambda e, self=self: self._focus_prev(self.top_entries, e.widget))
+            entry.bind("<Left>", lambda e, self=self: self._focus_prev(self.top_entries, e.widget))
             entry.bind("<Right>", lambda e, self=self: self._focus_next(self.top_entries, e.widget))
 
             w_id = self.canvas.create_window(x1, top_y, window=frame, anchor="nw")
             self.top_entry_window_ids.append(w_id)
             frame.left_line_id = line1.line_id
             self.text_entries.append(frame)
-            self.top_entries.append(entry)  # ← 追加：順序リストに登録
+            self.top_entries.append(entry)
 
-        # 下段：行
+        # 下段：行（従来通り、グループを使う）
         total_w = right_x - left_x
         self.group_row_frame = tk.Frame(
             self.canvas, width=total_w, height=group_row_height,
@@ -604,7 +697,9 @@ class SnapHierarchyApp:
             bg=("#eef" if self.split_mode else "#fafafa")
         )
         self.group_row_frame.pack_propagate(False)
-        self.canvas.create_window(left_x, top_y + entry_height + gap, window=self.group_row_frame, anchor="nw")
+        self.group_window_id = self.canvas.create_window(
+            left_x, top_y + entry_height + gap, window=self.group_row_frame, anchor="nw"
+        )
 
         self.group_canvas = tk.Canvas(
             self.group_row_frame, height=group_row_height, highlightthickness=0,
@@ -623,7 +718,9 @@ class SnapHierarchyApp:
         if not self.split_mode or len(self.lines) < 3:
             return
 
+        # 下段テキストを line_id ベースで保存
         self._snapshot_group_texts()
+
         xs = [ln.base_x for ln in self.lines]
         left_x = xs[0]
         cand, cand_dist = None, 1e9
@@ -649,6 +746,7 @@ class SnapHierarchyApp:
         self.group_separators.clear()
 
     def _rebuild_group_row(self):
+        """下段のグループ行を再構築（テキストは left_line_id ベースで復元）"""
         if self.group_row_frame is None or len(self.lines) < 2:
             return
 
@@ -666,10 +764,14 @@ class SnapHierarchyApp:
         for e in self.group_entries:
             e.destroy()
         self.group_entries.clear()
+        self.group_entry_spans.clear()
 
-        starts = [0] + sorted([b for b in self.group_boundaries if 1 <= b <= len(self.lines) - 2]) + [len(self.lines) - 1]
-        old = list(self.group_text_cache or [])
-        oi = 0
+        # 今保持している下段テキスト（left_line_id -> text）
+        texts_by_left_id = dict(self._group_text_map or {})
+
+        starts = [0] + sorted(
+            [b for b in self.group_boundaries if 1 <= b <= len(self.lines) - 2]
+        ) + [len(self.lines) - 1]
 
         for a, b in zip(starts[:-1], starts[1:]):
             seg_left = xs[a] - left_x
@@ -690,18 +792,24 @@ class SnapHierarchyApp:
                 )
             )
 
-            # 既存テキスト復元
-            if oi < len(old):
-                entry.insert(0, old[oi])
-            oi += 1
+            # 左端の line_id をキーにテキストを復元 & 保持
+            if 0 <= a < len(self.lines):
+                left_line = self.lines[a]
+                entry.left_line_id = left_line.line_id
+                if left_line.line_id in texts_by_left_id:
+                    entry.insert(0, texts_by_left_id[left_line.line_id])
+            else:
+                entry.left_line_id = None
 
             # ←→ の移動バインド（下段）
-            entry.bind("<Left>",  lambda e, self=self: self._focus_prev(self.group_entries, e.widget))
+            entry.bind("<Left>", lambda e, self=self: self._focus_prev(self.group_entries, e.widget))
             entry.bind("<Right>", lambda e, self=self: self._focus_next(self.group_entries, e.widget))
 
             entry.lift()
             self.group_entries.append(entry)
+            self.group_entry_spans.append((a, b))
 
+        # 分割線の再構築
         for b in self.group_boundaries:
             x_rel = xs[b] - left_x
             sep = tk.Frame(self.group_row_frame, bg="#000")
@@ -710,7 +818,8 @@ class SnapHierarchyApp:
             sep.lift()
             self.group_separators.append(sep)
 
-        self.group_text_cache = [e.get() for e in self.group_entries]
+        # 最新の UI から再度マップを作り直しておく
+        self._snapshot_group_texts()
 
     # ---------- リサイズ ----------
     def on_resize(self, event):
@@ -720,12 +829,35 @@ class SnapHierarchyApp:
 
     # ---------- ガイド ----------
     def show_insert_guides(self):
+        """
+        追加モード用ガイドを表示。
+        各線の「下側20px」の区間を赤くする。
+        ただし一番右の隠し線にはガイドを出さない。
+        """
         self.clear_insert_guides()
-        r = 6
-        for i, line in enumerate(self.lines):
-            cx, cy = line.top_x, line.top_y
-            oid = self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill="red")
-            self.guide_circles.append((oid, i, cx, cy))
+
+        if not self.lines:
+            return
+
+        guide_length = 20  # 下側何ピクセル分をガイドとして赤くするか
+
+        visible_lines = self.lines[:-1] if len(self.lines) >= 1 else []
+
+        for i, line in enumerate(visible_lines):
+            bx = line.base_x
+            by = line.base_y
+            y2 = by
+            y1 = max(line.top_y, by - guide_length)
+
+            oid = self.canvas.create_line(
+                bx, y1,
+                bx, y2,
+                fill="red",
+                width=4
+            )
+
+            # クリック判定のために、x と y 範囲を保存
+            self.guide_circles.append((oid, i, bx, y1, y2))
 
     def clear_insert_guides(self):
         for oid, *_ in self.guide_circles:
@@ -735,7 +867,8 @@ class SnapHierarchyApp:
     def show_delete_guides(self):
         self.clear_delete_guides()
         r = 6
-        for line in self.lines:
+        visible_lines = self.lines[:-1] if len(self.lines) >= 1 else []
+        for line in visible_lines:
             tx, ty = line.get_top()
             oid = self.canvas.create_oval(tx - r, ty - r, tx + r, ty + r, fill="blue")
             self.delete_guides.append(oid)
@@ -747,15 +880,7 @@ class SnapHierarchyApp:
 
     def show_snap_candidates(self, dragged_line):
         self.clear_snap_candidates()
-        def get_descendants(line):
-            res, st = set(), [line]
-            while st:
-                cur = st.pop()
-                for ch in cur.children:
-                    if ch not in res:
-                        res.add(ch); st.append(ch)
-            return res
-        # 必要なら候補描画を実装
+        # 必要なら候補描画を実装（今は未使用）
 
     def clear_snap_candidates(self):
         for oid in self.snap_candidates:
@@ -764,51 +889,94 @@ class SnapHierarchyApp:
 
     # ---------- 追加/削除 ----------
     def insert_line_at_index(self, index):
-        self._snapshot_group_texts()
+        """
+        index は「見えている線のインデックス」として解釈し、
+        実際には右端の隠し線の手前まででクランプする。
+        """
+        self._snapshot_current_texts()
         self.push_undo_state()
         new_id = max((line.line_id for line in self.lines), default=0) + 1
-        self.lines.insert(index, Line(self, self.canvas, 0.5, self.base_y_ratio, self.length, new_id))
+
+        visible_n = max(0, len(self.lines) - 1)
+        idx = max(0, min(index, visible_n))
+        insert_pos = min(idx, max(0, len(self.lines) - 1))
+
+        # グループ境界を右側へシフト（挿入位置以降）
+        self.group_boundaries = [
+            b + 1 if b >= insert_pos else b for b in self.group_boundaries
+        ]
+
+        self.lines.insert(insert_pos, Line(self, self.canvas, 0.5, self.base_y_ratio, self.length, new_id))
         self.renormalize_ratios()
         self.redraw_all()
-        self.line_count_var.set(str(len(self.lines)))
+        self.line_count_var.set(str(max(0, len(self.lines) - 1)))
 
     def append_line(self):
-        self.insert_line_at_index(len(self.lines))
+        visible_n = max(0, len(self.lines) - 1)
+        self.insert_line_at_index(visible_n)
 
     def remove_last_line(self):
-        if len(self.lines) <= 1:
+        if len(self.lines) <= 2:
             return
-        self._snapshot_group_texts()
+        self._snapshot_current_texts()
         self.push_undo_state()
-        line = self.lines.pop()
+        line = self.lines[-2]
+
+        # 下段テキストも対応位置を削除
+        self._group_text_map.pop(line.line_id, None)
+
         line.detach_from_parent()
         for child in list(line.children):
             child.detach_from_parent()
         self.canvas.delete(line.id)
+        self.lines.pop(-2)
         self.renormalize_ratios()
         self.group_boundaries = [b for b in self.group_boundaries if 1 <= b <= len(self.lines) - 2]
         self.redraw_all()
-        self.line_count_var.set(str(len(self.lines)))
+        self.line_count_var.set(str(max(0, len(self.lines) - 1)))
 
     def renormalize_ratios(self):
         n = len(self.lines)
         for i, line in enumerate(self.lines):
             line.base_ratio = self.margin + (1 - 2 * self.margin) * (i / (n - 1)) if n > 1 else 0.5
 
-    # ---------- マウス（上端ドラッグ系） ----------
+    # ---------- マウス（上端ドラッグ系 & 削除ホバー） ----------
     def on_press(self, event):
         self.start_xy = (event.x, event.y)
         if self.add_mode:
-            for (_, index, cx, cy) in self.guide_circles:
-                if hypot(event.x - cx, event.y - cy) < 10:
-                    self.insert_line_at_index(index); return
+            for (_, index, cx, y1, y2) in self.guide_circles:
+                if abs(event.x - cx) <= 10 and y1 <= event.y <= y2:
+                    self.insert_line_at_index(index)
+                    return
             return
+
         if self.delete_mode:
-            for line in self.lines:
+            # 削除する直前にハイライトを消しておく
+            self.clear_hover_highlight()
+            visible_lines = list(self.lines[:-1])
+            for line in visible_lines:
                 tx, ty = line.get_top()
                 if self.distance(event.x, event.y, tx, ty) < 15:
-                    self._snapshot_group_texts()
+                    # どの index の線かを覚えておく
+                    idx = self.lines.index(line)
+
+                    self._snapshot_current_texts()
                     self.push_undo_state()
+
+                    # 下段テキストから対応位置を削除
+                    self._group_text_map.pop(line.line_id, None)
+
+                    # グループ境界をシフト＆削除（この線の位置をまたぐ境界は消す）
+                    new_bnds = []
+                    for b in self.group_boundaries:
+                        if b == idx:
+                            continue  # ちょうどこの線の位置の境界は削除
+                        elif b > idx:
+                            new_bnds.append(b - 1)  # 右側は 1 つ左へ
+                        else:
+                            new_bnds.append(b)
+                    self.group_boundaries = new_bnds
+
                     line.detach_from_parent()
                     for child in list(line.children):
                         child.detach_from_parent()
@@ -817,13 +985,16 @@ class SnapHierarchyApp:
                     self.renormalize_ratios()
                     self.group_boundaries = [b for b in self.group_boundaries if 1 <= b <= len(self.lines) - 2]
                     self.redraw_all()
-                    self.line_count_var.set(str(len(self.lines)))
+                    self.line_count_var.set(str(max(0, len(self.lines) - 1)))
                     return
             return
-        for line in self.lines:
+
+        # ドラッグ開始判定（見えている線だけ）
+        for line in self.lines[:-1]:
             tx, ty = line.get_top()
             if self.distance(event.x, event.y, tx, ty) < 15:
-                self.drag_target = line; break
+                self.drag_target = line
+                break
         if self.drag_target:
             self.show_snap_candidates(self.drag_target)
 
@@ -839,11 +1010,10 @@ class SnapHierarchyApp:
         if not self.drag_target:
             return
         snapped = False
-        for other in self.lines:
+        for other in self.lines[:-1]:
             if other == self.drag_target:
                 continue
             if self.is_near(self.drag_target, other):
-                # 循環検出は残す（条件④のみ削除リクエストのため）
                 if self.detect_cycle(self.drag_target, other):
                     continue
                 self.drag_target.detach_from_parent()
@@ -858,15 +1028,14 @@ class SnapHierarchyApp:
                     if d < min_dist:
                         min_dist, closest_t = d, t
                 if closest_t is not None:
-                    # --- 交差チェックを削除し、即スナップ確定 ---
                     snap_x = other.base_x + closest_t * (other.top_x - other.base_x)
                     snap_y = other.base_y + closest_t * (other.top_y - other.base_y)
+                    self._snapshot_current_texts()
                     self.push_undo_state()
                     other.used_t_values.append(closest_t)
                     self.drag_target.snap_t = closest_t
                     self.drag_target.parent = other
                     other.children.append(self.drag_target)
-                    # 上端をスナップ位置に合わせた上で追従
                     self.drag_target.top_x = snap_x
                     self.drag_target.top_y = snap_y
                     self.drag_target.follow_parent()
@@ -876,6 +1045,49 @@ class SnapHierarchyApp:
             self.drag_target.detach_from_parent()
         self.drag_target = None
         self.clear_snap_candidates()
+
+    # --- 削除モード中のホバー処理（上段の右側だけハイライト） ---
+    def clear_hover_highlight(self):
+        for idx in self.highlighted_top_indices:
+            if 0 <= idx < len(self.text_entries):
+                frame = self.text_entries[idx]
+                frame.config(highlightbackground="#000", highlightthickness=1)
+        self.highlighted_top_indices.clear()
+
+    def highlight_textboxes_for_line_index(self, line_index):
+        self.clear_hover_highlight()
+
+        if line_index is None:
+            return
+        n = len(self.lines)
+        if n < 2:
+            return
+
+        if 0 <= line_index < len(self.text_entries):
+            frame = self.text_entries[line_index]
+            frame.config(highlightbackground="blue", highlightthickness=2)
+            self.highlighted_top_indices.append(line_index)
+
+    def on_motion(self, event):
+        if not self.delete_mode:
+            if self.highlighted_top_indices:
+                self.clear_hover_highlight()
+            return
+
+        target_idx = None
+        min_d = float("inf")
+        for i, line in enumerate(self.lines[:-1]):
+            tx, ty = line.get_top()
+            d = self.distance(event.x, event.y, tx, ty)
+            if d < 15 and d < min_d:
+                min_d = d
+                target_idx = i
+
+        if target_idx is not None:
+            self.highlight_textboxes_for_line_index(target_idx)
+        else:
+            if self.highlighted_top_indices:
+                self.clear_hover_highlight()
 
     # ---------- 幾何 ----------
     def is_near(self, line1, line2):
@@ -922,7 +1134,7 @@ class SnapHierarchyApp:
 
     # ---------- Undo/Redo & Save/Load ----------
     def push_undo_state(self):
-        self._snapshot_group_texts()
+        self._snapshot_current_texts()
         state = self.capture_state()
         self.undo_stack.append(state)
         self.redo_stack.clear()
@@ -944,71 +1156,113 @@ class SnapHierarchyApp:
             key = getattr(frame, "left_line_id", None)
             if key is not None:
                 top_texts[str(key)] = entry.get()
+
+        # 下段テキストを line_id ベースで保存
+        self._snapshot_group_texts()
         group = {
             "boundaries": list(self.group_boundaries),
-            "texts": [e.get() for e in self.group_entries] if self.group_entries else list(self.group_text_cache)
+            "texts_by_left_id": {str(k): v for k, v in self._group_text_map.items()}
         }
-        return {"lines": lines_data, "top_texts": top_texts, "group": group,
-                "view": {"min": self.view_min, "max": self.view_max}}
+        return {
+            "lines": lines_data,
+            "top_texts": top_texts,
+            "group": group,
+            "view": {"min": self.view_min, "max": self.view_max}
+        }
 
     def restore_state(self, state):
-        self.lines.clear()
-        self.canvas.delete("all")
+        """辞書 state からアプリ状態を復元する（Undo/Redo/読み込み共通）"""
+        # 復元中フラグ ON：描画中に _snapshot_current_texts が現在の UI を上書きしないようにする
+        self.is_restoring = True
+        try:
+            self.lines.clear()
+            self.canvas.delete("all")
 
-        line_dict = {}
-        for item in state["lines"]:
-            line = Line(self, self.canvas, item["base_ratio"], self.base_y_ratio, self.length, item["id"])
-            line.top_ratio_x = item.get("top_ratio_x", 0.5)
-            line.top_ratio_y = item.get("top_ratio_y", 0.5)
-            line_dict[item["id"]] = line
-            self.lines.append(line)
+            # ---- 線の復元 ----
+            line_dict = {}
+            for item in state["lines"]:
+                line = Line(self, self.canvas, item["base_ratio"], self.base_y_ratio, self.length, item["id"])
+                line.top_ratio_x = item.get("top_ratio_x", 0.5)
+                line.top_ratio_y = item.get("top_ratio_y", 0.5)
+                line_dict[item["id"]] = line
+                self.lines.append(line)
 
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        for line in self.lines:
-            line.update_base_position(width, height)
-            if line.top_ratio_x is None or line.top_ratio_y is None:
-                line.top_x = line.base_x
-                line.top_y = line.base_y - self.length
-            else:
-                line.top_x = line.map_x(line.top_ratio_x, width)
-                line.top_y = int((line.top_ratio_y or 0.5) * height)
-            line.update_top_ratios(width, height)
+            width = self.canvas.winfo_width()
+            height = self.canvas.winfo_height()
+            for line in self.lines:
+                line.update_base_position(width, height)
+                if line.top_ratio_x is None or line.top_ratio_y is None:
+                    line.top_x = line.base_x
+                    line.top_y = line.base_y - self.length
+                else:
+                    line.top_x = line.map_x(line.top_ratio_x, width)
+                    line.top_y = int((line.top_ratio_y or 0.5) * height)
+                line.update_top_ratios(width, height)
 
-        for item in state["lines"]:
-            line = line_dict[item["id"]]
-            parent_id = item.get("parent_id"); snap_t = item.get("snap_t")
-            if parent_id is not None and parent_id in line_dict:
-                parent = line_dict[parent_id]
-                line.parent = parent; line.snap_t = snap_t
-                parent.children.append(line); parent.used_t_values.append(snap_t)
-                line.follow_parent()
+            for item in state["lines"]:
+                line = line_dict[item["id"]]
+                parent_id = item.get("parent_id")
+                snap_t = item.get("snap_t")
+                if parent_id is not None and parent_id in line_dict:
+                    parent = line_dict[parent_id]
+                    line.parent = parent
+                    line.snap_t = snap_t
+                    parent.children.append(line)
+                    if snap_t is not None:
+                        parent.used_t_values.append(snap_t)
+                    line.follow_parent()
 
-        self.renormalize_ratios()
+            self.renormalize_ratios()
 
-        v = state.get("view", {})
-        self.view_min = float(v.get("min", self.view_min))
-        self.view_max = float(v.get("max", self.view_max))
-        self.view_min_var.set(str(int(round(self.view_min * 100))))
-        self.view_max_var.set(str(int(round(self.view_max * 100))))
+            # ---- ビュー範囲 ----
+            v = state.get("view", {})
+            self.view_min = float(v.get("min", self.view_min))
+            self.view_max = float(v.get("max", self.view_max))
+            self.view_min_var.set(str(int(round(self.view_min * 100))))
+            self.view_max_var.set(str(int(round(self.view_max * 100))))
 
-        self.redraw_all()
+            # ---- 上段テキスト（line_id -> text）----
+            self._top_text_map = {}
+            if "top_texts" in state:
+                for k, txt in state["top_texts"].items():
+                    try:
+                        self._top_text_map[int(k)] = txt
+                    except ValueError:
+                        pass
 
-        if "top_texts" in state:
-            for frame in self.text_entries:
-                entry = frame.winfo_children()[0]
-                key = str(getattr(frame, "left_line_id", None))
-                if key in state["top_texts"]:
-                    entry.delete(0, tk.END); entry.insert(0, state["top_texts"][key])
+            # ここで redraw_all() を呼ぶと、_top_text_map を使って上段テキストが描画される
+            self.redraw_all()
 
-        grp = state.get("group", {})
-        bnds = grp.get("boundaries", []); txts = grp.get("texts", [])
-        self.group_boundaries = [b for b in bnds if 1 <= b <= len(self.lines) - 2]
-        self.group_text_cache = txts
-        self._rebuild_group_row()
-        self.master.after_idle(self._rebuild_group_row)
-        self._update_status()
-        self.line_count_var.set(str(len(self.lines)))
+            # ---- 下段グループ行 ----
+            grp = state.get("group", {})
+            bnds = grp.get("boundaries", [])
+            self.group_boundaries = [b for b in bnds if 1 <= b <= len(self.lines) - 2]
+
+            texts_by_left = grp.get("texts_by_left_id")
+            if texts_by_left is None:
+                # 旧形式（texts のみ）の互換対応
+                old_texts = grp.get("texts", [])
+                texts_by_left = {}
+                starts = [0] + sorted(self.group_boundaries) + [len(self.lines) - 1]
+                for (a, b), txt in zip(zip(starts[:-1], starts[1:]), old_texts):
+                    if 0 <= a < len(self.lines):
+                        texts_by_left[str(self.lines[a].line_id)] = txt
+
+            self._group_text_map = {}
+            if texts_by_left is not None:
+                for k, txt in texts_by_left.items():
+                    try:
+                        self._group_text_map[int(k)] = txt
+                    except ValueError:
+                        pass
+
+            self._rebuild_group_row()
+            self.master.after_idle(self._rebuild_group_row)
+            self._update_status()
+            self.line_count_var.set(str(max(0, len(self.lines) - 1)))
+        finally:
+            # 復元終了
+            self.is_restoring = False
 
     def undo(self):
         if not self.undo_stack:
@@ -1025,13 +1279,13 @@ class SnapHierarchyApp:
         self.restore_state(state)
 
     def save_state(self):
-        self._snapshot_group_texts()
+        self._snapshot_current_texts()
         data = {
             "lines": [],
             "top_texts": {},
             "group": {
                 "boundaries": list(self.group_boundaries),
-                "texts": [e.get() for e in self.group_entries] if self.group_entries else list(self.group_text_cache)
+                "texts_by_left_id": {str(k): v for k, v in self._group_text_map.items()}
             },
             "view": {"min": self.view_min, "max": self.view_max}
         }
@@ -1062,61 +1316,12 @@ class SnapHierarchyApp:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        self.lines.clear()
-        self.canvas.delete("all")
+        # 共通復元ロジックに委譲
+        self.restore_state(data)
 
-        line_dict = {}
-        for item in data["lines"]:
-            line = Line(self, self.canvas, item["base_ratio"], self.base_y_ratio, self.length, item["id"])
-            line.top_ratio_x = item.get("top_ratio_x", 0.5)
-            line.top_ratio_y = item.get("top_ratio_y", 0.5)
-            line_dict[item["id"]] = line
-            self.lines.append(line)
-
-        width = self.canvas.winfo_width()
-        height = self.canvas.winfo_height()
-        for line in self.lines:
-            line.update_base_position(width, height)
-            if line.top_ratio_x is None or line.top_ratio_y is None:
-                line.top_x = line.base_x; line.top_y = line.base_y - self.length
-            else:
-                line.top_x = line.map_x(line.top_ratio_x, width)
-                line.top_y = int((line.top_ratio_y or 0.5) * height)
-            line.update_top_ratios(width, height)
-
-        for item in data["lines"]:
-            line = line_dict[item["id"]]
-            parent_id = item.get("parent_id"); snap_t = item.get("snap_t")
-            if parent_id is not None and parent_id in line_dict:
-                parent = line_dict[parent_id]
-                line.parent = parent; line.snap_t = snap_t
-                parent.children.append(line); parent.used_t_values.append(snap_t)
-                line.follow_parent()
-
-        self.renormalize_ratios()
-
-        v = data.get("view", {})
-        self.view_min = float(v.get("min", 0.0))
-        self.view_max = float(v.get("max", 1.0))
-        self.view_min_var.set(str(int(round(self.view_min * 100))))
-        self.view_max_var.set(str(int(round(self.view_max * 100))))
-
-        self.redraw_all()
-
-        for frame in self.text_entries:
-            entry = frame.winfo_children()[0]
-            key = str(getattr(frame, "left_line_id", None))
-            if "top_texts" in data and key in data["top_texts"]:
-                entry.delete(0, tk.END); entry.insert(0, data["top_texts"][key])
-
-        grp = data.get("group", {})
-        bnds = grp.get("boundaries", []); txts = grp.get("texts", [])
-        self.group_boundaries = [b for b in bnds if 1 <= b <= len(self.lines) - 2]
-        self.group_text_cache = txts
-        self._rebuild_group_row()
-        self.master.after_idle(self._rebuild_group_row)
-        self._update_status()
-        self.line_count_var.set(str(len(self.lines)))
+        # ファイル読み込み直後は Undo/Redo スタックをクリア
+        self.undo_stack.clear()
+        self.redo_stack.clear()
 
 
 if __name__ == "__main__":
@@ -1124,4 +1329,5 @@ if __name__ == "__main__":
     root.geometry("1200x800")
     app = SnapHierarchyApp(root, num_lines=6)
     root.mainloop()
+
 
