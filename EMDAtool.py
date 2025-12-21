@@ -1,13 +1,12 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sun Nov  9 22:00:50 2025
-
-@author: wadaso
-"""
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from math import hypot
 import json
+
+try:
+    from PIL import ImageGrab
+except ImportError:
+    ImageGrab = None
 
 
 class Line:
@@ -47,15 +46,28 @@ class Line:
         w = max(1, canvas_width)
         return (screen_x / w) * (vmax - vmin) + vmin
 
+
+    def map_y(self, world_ratio_y, canvas_height):
+        """世界座標(0〜1) → 画面Y。view_y_min/max に従って写像する。"""
+        vmin, vmax = self.app.view_y_min, self.app.view_y_max
+        h = max(1, canvas_height)
+        return int(((world_ratio_y - vmin) / (vmax - vmin)) * h)
+
+    def unmap_y(self, screen_y, canvas_height):
+        """画面Y → 世界座標(0〜1)。view_y_min/max に従って逆写像する。"""
+        vmin, vmax = self.app.view_y_min, self.app.view_y_max
+        h = max(1, canvas_height)
+        return (screen_y / h) * (vmax - vmin) + vmin
+
     # --- 幾何更新 ---
     def update_base_position(self, canvas_width, canvas_height):
         self.base_x = self.map_x(self.base_ratio, canvas_width)
-        self.base_y = int(canvas_height * self.base_y_ratio)
+        self.base_y = self.map_y(self.base_y_ratio, canvas_height)
 
         if self.parent is None and self.snap_t is None:
             if self.children and self.top_ratio_x is not None and self.top_ratio_y is not None:
                 self.top_x = self.map_x(self.top_ratio_x, canvas_width)
-                self.top_y = int(canvas_height * self.top_ratio_y)
+                self.top_y = self.map_y(self.top_ratio_y, canvas_height)
             else:
                 self.top_x = self.base_x
                 self.top_y = self.base_y - self.length
@@ -63,7 +75,7 @@ class Line:
     def update_top_ratios(self, canvas_width, canvas_height):
         if canvas_width > 0 and canvas_height > 0:
             self.top_ratio_x = self.unmap_x(self.top_x, canvas_width)
-            self.top_ratio_y = self.top_y / canvas_height
+            self.top_ratio_y = self.unmap_y(self.top_y, canvas_height)
 
     def draw(self):
         if self.id:
@@ -125,6 +137,9 @@ class SnapHierarchyApp:
         # viewport（世界 0.0〜1.0）
         self.view_min = 0.0
         self.view_max = 1.0
+        self.view_y_min = 0.0
+        self.view_y_max = 1.0
+        self._min_span_y = 0.02
         self._min_span = 0.02   # 2% 以下にはしない（極端ズーム抑制）
         self._pan_margin = 0.0005
 
@@ -164,6 +179,7 @@ class SnapHierarchyApp:
         self.panning = False
         self.pan_last_x = None
 
+        self.pan_last_y = None
         # ホバー中ハイライト管理（上段のみ）
         self.highlighted_top_indices = []
 
@@ -173,14 +189,33 @@ class SnapHierarchyApp:
         # 復元中フラグ（ロード／Undo／Redo の間は True）
         self.is_restoring = False
 
+        # 初期状態保存用
+        self.initial_state = None
+
         self.setup_ui(num_lines)
         self.bind_events()
         self.add_menu_bar()
+
+        # 起動時の状態を「初期状態」として保存
+        self.initial_state = self.capture_state()
 
     # ---------- UI ----------
     def setup_ui(self, num_lines):
         control_frame = tk.Frame(self.master)
         control_frame.pack(fill="x")
+
+        # 左端：スクリーンショットボタン（キャンバス外なので画像には写らない）
+        ss_frame = tk.Frame(control_frame)
+        ss_frame.pack(side=tk.LEFT, padx=10)
+        self.sshot_button = tk.Button(
+            ss_frame,
+            text="画面を画像として保存",
+            command=self.save_screenshot,
+            bg="#ffcc66",  # ← 色を変えたいときはここ
+            fg="black",
+            activebackground="#ffdd88"
+        )
+        self.sshot_button.pack(side=tk.LEFT)
 
         # 左：モード
         mode_frame = tk.Frame(control_frame)
@@ -235,7 +270,7 @@ class SnapHierarchyApp:
         self.line_count_entry.bind("<Up>", lambda e: self._step_line_count(+1))
         self.line_count_entry.bind("<Down>", lambda e: self._step_line_count(-1))
 
-        # キャンバス
+        # キャンバス（ここだけをスクショする）
         self.canvas = tk.Canvas(self.master, bg="white")
         self.canvas.pack(fill="both", expand=True)
 
@@ -245,7 +280,6 @@ class SnapHierarchyApp:
         self._update_status()
 
     def _validate_int(self, P: str) -> bool:
-        """エントリの入力が空 or 正の整数なら許可"""
         return (P == "") or (P.isdigit() and int(P) >= 1)
 
     def _step_line_count(self, step: int):
@@ -262,6 +296,9 @@ class SnapHierarchyApp:
 
     # ---------- ビューポート操作 ----------
     def apply_view_range(self):
+        """表示範囲(％)の入力を適用。
+        既存UIは x のみだが、ズーム倍率は y にも同倍率で反映する。
+        """
         try:
             vmin = float(self.view_min_var.get()) / 100.0
             vmax = float(self.view_max_var.get()) / 100.0
@@ -273,7 +310,23 @@ class SnapHierarchyApp:
             center = (vmin + vmax) / 2
             vmin = max(0.0, center - self._min_span / 2)
             vmax = min(1.0, center + self._min_span / 2)
+
+        old_span_x = (self.view_max - self.view_min)
+        new_span_x = (vmax - vmin)
+        # x を先に確定
         self.view_min, self.view_max = vmin, vmax
+
+        # y は「xのズーム倍率」と同じだけ拡大/縮小（中心固定）
+        if old_span_x > 0:
+            factor = old_span_x / new_span_x
+            y_center = (self.view_y_min + self.view_y_max) / 2
+            span_y = (self.view_y_max - self.view_y_min) / factor
+            span_y = max(self._min_span_y, min(1.0, span_y))
+            new_ymin = y_center - span_y / 2
+            new_ymax = new_ymin + span_y
+            new_ymin, new_ymax = self._clamp_view(new_ymin, new_ymax)
+            self.view_y_min, self.view_y_max = new_ymin, new_ymax
+
         self.view_min_var.set(str(int(round(vmin * 100))))
         self.view_max_var.set(str(int(round(vmax * 100))))
         self.redraw_all()
@@ -292,29 +345,58 @@ class SnapHierarchyApp:
             vmax = 1.0
         return vmin, vmax
 
+    def zoom_at_worldxy(self, world_x, world_y, factor):
+        """2Dズーム（x,y を同倍率で拡大/縮小）。アンカー(world_x, world_y)を基準にする。"""
+        # --- x ---
+        vmin_x, vmax_x = self.view_min, self.view_max
+        span_x = (vmax_x - vmin_x) / factor
+        span_x = max(self._min_span, min(1.0, span_x))
+        left_ratio = (world_x - vmin_x) / (vmax_x - vmin_x) if vmax_x > vmin_x else 0.5
+        new_vmin_x = world_x - span_x * left_ratio
+        new_vmax_x = new_vmin_x + span_x
+        new_vmin_x, new_vmax_x = self._clamp_view(new_vmin_x, new_vmax_x)
+
+        # --- y ---
+        vmin_y, vmax_y = self.view_y_min, self.view_y_max
+        span_y = (vmax_y - vmin_y) / factor
+        span_y = max(self._min_span_y, min(1.0, span_y))
+        top_ratio = (world_y - vmin_y) / (vmax_y - vmin_y) if vmax_y > vmin_y else 0.5
+        new_vmin_y = world_y - span_y * top_ratio
+        new_vmax_y = new_vmin_y + span_y
+        new_vmin_y, new_vmax_y = self._clamp_view(new_vmin_y, new_vmax_y)
+
+        self.view_min, self.view_max = new_vmin_x, new_vmax_x
+        self.view_y_min, self.view_y_max = new_vmin_y, new_vmax_y
+        # 画面の表示欄は x のみ（既存UI互換）
+        self.view_min_var.set(str(int(round(new_vmin_x * 100))))
+        self.view_max_var.set(str(int(round(new_vmax_x * 100))))
+        self.redraw_all()
+        self._update_status()
+
     def zoom_at_worldx(self, world_x, factor):
-        vmin, vmax = self.view_min, self.view_max
-        span = (vmax - vmin) / factor
-        span = max(self._min_span, min(1.0, span))
-        left_ratio = (world_x - vmin) / (vmax - vmin) if vmax > vmin else 0.5
-        new_vmin = world_x - span * left_ratio
-        new_vmax = new_vmin + span
-        new_vmin, new_vmax = self._clamp_view(new_vmin, new_vmax)
-        self.view_min, self.view_max = new_vmin, new_vmax
-        self.view_min_var.set(str(int(round(new_vmin * 100))))
-        self.view_max_var.set(str(int(round(new_vmax * 100))))
+        """互換用：従来API。yは現在の中心をアンカーにして同倍率でズームする。"""
+        world_y = (self.view_y_min + self.view_y_max) / 2
+        self.zoom_at_worldxy(world_x, world_y, factor)
+    def pan_by_xy(self, dx_world, dy_world):
+        """2Dパン（表示範囲を平行移動）。"""
+        # x
+        vmin_x = self.view_min + dx_world
+        vmax_x = self.view_max + dx_world
+        vmin_x, vmax_x = self._clamp_view(vmin_x, vmax_x)
+        # y
+        vmin_y = self.view_y_min + dy_world
+        vmax_y = self.view_y_max + dy_world
+        vmin_y, vmax_y = self._clamp_view(vmin_y, vmax_y)
+        self.view_min, self.view_max = vmin_x, vmax_x
+        self.view_y_min, self.view_y_max = vmin_y, vmax_y
+        self.view_min_var.set(str(int(round(vmin_x * 100))))
+        self.view_max_var.set(str(int(round(vmax_x * 100))))
         self.redraw_all()
         self._update_status()
 
     def pan_by(self, dx_world):
-        vmin = self.view_min + dx_world
-        vmax = self.view_max + dx_world
-        vmin, vmax = self._clamp_view(vmin, vmax)
-        self.view_min, self.view_max = vmin, vmax
-        self.view_min_var.set(str(int(round(vmin * 100))))
-        self.view_max_var.set(str(int(round(vmax * 100))))
-        self.redraw_all()
-        self._update_status()
+        """互換用：従来API。x方向のみパンする。"""
+        self.pan_by_xy(dx_world, 0.0)
 
     # ---------- モード切替 ----------
     def toggle_add_mode(self):
@@ -387,60 +469,74 @@ class SnapHierarchyApp:
         self.master.bind_all("-", lambda e: self.zoom_keyboard(1/1.2))
         self.master.bind_all("<Left>", lambda e: self.pan_keyboard(-0.05))
         self.master.bind_all("<Right>", lambda e: self.pan_keyboard(+0.05))
-        self.master.bind_all("0", lambda e: self.reset_view())
+        # ※ 0キーによるリセットは削除
 
     # ---------- ホイール/パン ----------
     def canvas_x_to_world(self, x_screen):
         w = max(1, self.canvas.winfo_width())
         return (x_screen / w) * (self.view_max - self.view_min) + self.view_min
 
+    def canvas_y_to_world(self, y_screen):
+        h = max(1, self.canvas.winfo_height())
+        return (y_screen / h) * (self.view_y_max - self.view_y_min) + self.view_y_min
     def on_wheel(self, event):
+        # Shift + ホイール：縦パン（y方向）
         if (event.state & 0x0001) != 0:  # Shift
             steps = (event.delta / 120) if event.delta else 0
-            dx_world = -steps * (self.view_max - self.view_min) * 0.05
-            self.pan_by(dx_world)
+            dy_world = -steps * (self.view_y_max - self.view_y_min) * 0.05
+            self.pan_by_xy(0.0, dy_world)
             return
+        # 通常ホイール：2Dズーム（x,y 同倍率）
         world_x = self.canvas_x_to_world(event.x)
+        world_y = self.canvas_y_to_world(event.y)
         factor = 1.2 if (event.delta > 0) else (1/1.2)
-        self.zoom_at_worldx(world_x, factor)
+        self.zoom_at_worldxy(world_x, world_y, factor)
 
     def on_wheel_linux(self, direction, event):
+        # Shift + ホイール：縦パン（y方向）
         if (event.state & 0x0001) != 0:  # Shift
-            dx_world = -direction * (self.view_max - self.view_min) * 0.05
-            self.pan_by(dx_world)
+            dy_world = -direction * (self.view_y_max - self.view_y_min) * 0.05
+            self.pan_by_xy(0.0, dy_world)
             return
         world_x = self.canvas_x_to_world(event.x)
+        world_y = self.canvas_y_to_world(event.y)
         factor = 1.2 if (direction > 0) else (1/1.2)
-        self.zoom_at_worldx(world_x, factor)
+        self.zoom_at_worldxy(world_x, world_y, factor)
 
     def on_pan_start(self, event):
         self.panning = True
         self.pan_last_x = event.x
-
+        self.pan_last_y = event.y
     def on_pan_drag(self, event):
         if not self.panning:
             return
         dx_px = event.x - self.pan_last_x
+        dy_px = event.y - self.pan_last_y
         self.pan_last_x = event.x
+        self.pan_last_y = event.y
         w = max(1, self.canvas.winfo_width())
+        h = max(1, self.canvas.winfo_height())
         dx_world = -(dx_px / w) * (self.view_max - self.view_min)
-        if abs(dx_world) < self._pan_margin:
+        dy_world = -(dy_px / h) * (self.view_y_max - self.view_y_min)
+        if abs(dx_world) < self._pan_margin and abs(dy_world) < self._pan_margin:
             return
-        self.pan_by(dx_world)
+        self.pan_by_xy(dx_world, dy_world)
 
     def on_pan_end(self, event):
         self.panning = False
         self.pan_last_x = None
-
+        self.pan_last_y = None
+        self.pan_last_y = None
     def zoom_keyboard(self, factor):
         world_x = (self.view_min + self.view_max) / 2
-        self.zoom_at_worldx(world_x, factor)
-
+        world_y = (self.view_y_min + self.view_y_max) / 2
+        self.zoom_at_worldxy(world_x, world_y, factor)
     def pan_keyboard(self, fraction):
         self.pan_by((self.view_max - self.view_min) * fraction)
 
     def reset_view(self):
         self.view_min, self.view_max = 0.0, 1.0
+        self.view_y_min, self.view_y_max = 0.0, 1.0
         self.view_min_var.set("0")
         self.view_max_var.set("100")
         self.redraw_all()
@@ -448,11 +544,6 @@ class SnapHierarchyApp:
 
     # ---------- 線 本数変更など ----------
     def update_line_count_from_entry(self, event=None):
-        """
-        line_count_entry に入力される値は「見えている線の本数」と扱い、
-        内部的な本数は「見えている本数 + 1」とする。
-        一番右の線は内部に存在するが、描画・操作はしない。
-        """
         try:
             if not self.line_count_var.get():
                 return
@@ -465,17 +556,14 @@ class SnapHierarchyApp:
             if new_visible == current_visible:
                 return
 
-            # 変更前のテキスト状態を保存（Undo 用）
             self._snapshot_current_texts()
             self.push_undo_state()
 
             target_total = new_visible + 1  # 右端の隠し線を含む本数
 
-            # 本数を増やす場合
             if target_total > current_total:
                 for _ in range(target_total - current_total):
                     new_id = max((line.line_id for line in self.lines), default=0) + 1
-                    # 追加される線は「右端の隠し線の手前」に入れる
                     insert_index = max(0, len(self.lines) - 1)
 
                     # グループ境界を右側へシフト（挿入位置以降）
@@ -488,7 +576,6 @@ class SnapHierarchyApp:
                         Line(self, self.canvas, 0.5, self.base_y_ratio, self.length, new_id)
                     )
 
-            # 本数を減らす場合（見えている線だけ減らす）
             elif target_total < current_total:
                 # 右端から見える線を削っていく
                 while len(self.lines) > target_total and len(self.lines) > 1:
@@ -558,11 +645,6 @@ class SnapHierarchyApp:
 
     # ---------- 上段/下段 UI ----------
     def _snapshot_group_texts(self):
-        """
-        下段テキストを『left_line_id → テキスト』で保存する。
-        ここでは self.lines のインデックスを使わず、
-        各 Entry に持たせた entry.left_line_id を使う。
-        """
         self._group_text_map = {}
         for entry in self.group_entries:
             key = getattr(entry, "left_line_id", None)
@@ -570,12 +652,9 @@ class SnapHierarchyApp:
                 self._group_text_map[key] = entry.get()
 
     def _snapshot_current_texts(self):
-        """上段・下段のテキスト状態を line_id ベースでスナップショット"""
-        # 復元中は何もしない（ロードやUndo/Redo直後の top_texts を壊さない）
         if getattr(self, "is_restoring", False):
             return
 
-        # 上段
         self._top_text_map = {}
         for frame in self.text_entries:
             entry = frame.winfo_children()[0]
@@ -583,7 +662,6 @@ class SnapHierarchyApp:
             if key is not None:
                 self._top_text_map[key] = entry.get()
 
-        # 下段
         self._snapshot_group_texts()
 
     # ==== ここから：矢印キー移動のユーティリティ ====
@@ -689,7 +767,7 @@ class SnapHierarchyApp:
             self.text_entries.append(frame)
             self.top_entries.append(entry)
 
-        # 下段：行（従来通り、グループを使う）
+        # 下段：行
         total_w = right_x - left_x
         self.group_row_frame = tk.Frame(
             self.canvas, width=total_w, height=group_row_height,
@@ -1124,13 +1202,68 @@ class SnapHierarchyApp:
         filemenu.add_command(label="保存", command=self.save_state)
         filemenu.add_command(label="読み込み", command=self.load_state)
         menubar.add_cascade(label="ファイル", menu=filemenu)
+
         editmenu = tk.Menu(menubar, tearoff=0)
         editmenu.add_command(label="Undo", command=self.undo)
         editmenu.add_command(label="Redo", command=self.redo)
+        editmenu.add_separator()
+        editmenu.add_command(label="初期状態にリセット", command=self.reset_to_initial)
+        menubar.add_cascade(label="編集", menu=editmenu)
+
         viewmenu = tk.Menu(menubar, tearoff=0)
         viewmenu.add_command(label="リセット (0〜100%)", command=self.reset_view)
         menubar.add_cascade(label="表示", menu=viewmenu)
+
         self.master.config(menu=menubar)
+
+    # ---------- スクリーンショット ----------
+    def save_screenshot(self):
+        """キャンバス部分だけを画像として保存"""
+        if ImageGrab is None:
+            messagebox.showerror(
+                "エラー",
+                "Pillow がインストールされていないため、スクリーンショットを保存できません。\n\n"
+                "コマンドプロンプトで次を実行してください：\n\npip install pillow"
+            )
+            return
+
+        # 描画更新
+        self.master.update_idletasks()
+
+        # キャンバスの絶対座標とサイズ
+        x = self.canvas.winfo_rootx()
+        y = self.canvas.winfo_rooty()
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+
+        if w <= 0 or h <= 0:
+            messagebox.showerror("エラー", "キャンバスのサイズが不正です。ウィンドウを一度表示してからお試しください。")
+            return
+
+        bbox = (x, y, x + w, y + h)
+        img = ImageGrab.grab(bbox=bbox)
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[
+                ("PNG 画像", "*.png"),
+                ("JPEG 画像", "*.jpg;*.jpeg"),
+                ("すべてのファイル", "*.*")
+            ],
+            title="キャンバスのスクリーンショットの保存先を選択"
+        )
+        if not filepath:
+            return
+
+        ext = filepath.lower().split(".")[-1]
+        try:
+            if ext in ("jpg", "jpeg"):
+                img = img.convert("RGB")
+                img.save(filepath, quality=95)
+            else:
+                img.save(filepath)
+        except Exception as e:
+            messagebox.showerror("保存エラー", f"画像の保存に失敗しました。\n\n{e}")
 
     # ---------- Undo/Redo & Save/Load ----------
     def push_undo_state(self):
@@ -1167,7 +1300,7 @@ class SnapHierarchyApp:
             "lines": lines_data,
             "top_texts": top_texts,
             "group": group,
-            "view": {"min": self.view_min, "max": self.view_max}
+            "view": {"xmin": self.view_min, "xmax": self.view_max, "ymin": self.view_y_min, "ymax": self.view_y_max}
         }
 
     def restore_state(self, state):
@@ -1216,8 +1349,11 @@ class SnapHierarchyApp:
 
             # ---- ビュー範囲 ----
             v = state.get("view", {})
-            self.view_min = float(v.get("min", self.view_min))
-            self.view_max = float(v.get("max", self.view_max))
+            # 互換：旧形式 {min,max} / 新形式 {xmin,xmax,ymin,ymax}
+            self.view_min = float(v.get("xmin", v.get("min", self.view_min)))
+            self.view_max = float(v.get("xmax", v.get("max", self.view_max)))
+            self.view_y_min = float(v.get("ymin", self.view_y_min))
+            self.view_y_max = float(v.get("ymax", self.view_y_max))
             self.view_min_var.set(str(int(round(self.view_min * 100))))
             self.view_max_var.set(str(int(round(self.view_max * 100))))
 
@@ -1278,6 +1414,20 @@ class SnapHierarchyApp:
         state = self.redo_stack.pop()
         self.restore_state(state)
 
+    # --- 初期状態に戻す ---
+    def reset_to_initial(self):
+        """
+        起動直後に保存した初期状態に、編集メニューから戻す。
+        この操作自体も Undo できるように、実行前の状態を Undo スタックに積む。
+        """
+        if self.initial_state is None:
+            return
+        # 現在の状態を Undo に積む
+        self.push_undo_state()
+        # initial_state をディープコピーしてから復元
+        state_copy = json.loads(json.dumps(self.initial_state))
+        self.restore_state(state_copy)
+
     def save_state(self):
         self._snapshot_current_texts()
         data = {
@@ -1287,7 +1437,7 @@ class SnapHierarchyApp:
                 "boundaries": list(self.group_boundaries),
                 "texts_by_left_id": {str(k): v for k, v in self._group_text_map.items()}
             },
-            "view": {"min": self.view_min, "max": self.view_max}
+            "view": {"xmin": self.view_min, "xmax": self.view_max, "ymin": self.view_y_min, "ymax": self.view_y_max}
         }
         for line in self.lines:
             data["lines"].append({
@@ -1329,5 +1479,6 @@ if __name__ == "__main__":
     root.geometry("1200x800")
     app = SnapHierarchyApp(root, num_lines=6)
     root.mainloop()
+
 
 
